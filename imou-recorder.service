@@ -1,0 +1,24 @@
+[Unit]
+Description=Imou Camera Video Playback Recording and MQTT Daemon
+After=network.target
+
+[Service]
+# Service execution settings
+Type=simple
+User=root
+WorkingDirectory=/var/www/imou-playback-app
+ExecStart=/usr/bin/node server.js
+
+# Auto restart on failure or system exit
+Restart=always
+RestartSec=5
+
+# Load environment variables
+Environment=NODE_ENV=production
+
+# Output redirection for logs
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

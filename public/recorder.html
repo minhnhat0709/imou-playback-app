@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Imou Headless Recorder</title>
+  <link href="./imou-player.css" rel="stylesheet" />
+  <script src="./imou-player.js"></script>
+  <style>
+    body, html {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: #000;
+      overflow: hidden;
+    }
+    #player-container {
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div id="player-container"></div>
+
+  <script>
+    // Global status for Puppeteer to read
+    window.recorderStatus = {
+      initialized: false,
+      playing: false,
+      recording: false,
+      error: null,
+      downloadStarted: false
+    };
+
+    let playerInstance = null;
+
+    // Initialize player via query parameters
+    function initPlayer() {
+      const urlParams = new URLSearchParams(window.location.search);
+      const deviceId = urlParams.get('deviceId');
+      const channelId = urlParams.get('channelId') || '0';
+      const token = urlParams.get('kitToken');
+      const beginTime = urlParams.get('beginTime');
+      const endTime = urlParams.get('endTime');
+      const code = urlParams.get('code') || deviceId;
+      const dataCenter = urlParams.get('dataCenter') || 'sg';
+      const domain = `https://openapi-${dataCenter.toLowerCase()}.easy4ip.com`;
+
+      if (!deviceId || !token || !beginTime || !endTime) {
+        window.recorderStatus.error = "Missing query parameters: deviceId, kitToken, beginTime, endTime";
+        console.error(window.recorderStatus.error);
+        return;
+      }
+
+      try {
+        playerInstance = new imouPlayer({
+          id: "player-container",
+          width: 800,
+          height: 400,
+          deviceId: deviceId,
+          channelId: Number(channelId),
+          token: token,
+          type: 2, // Playback
+          recordType: "localRecord",
+          beginTime: beginTime,
+          endTime: endTime,
+          WasmLibPath: "/",
+          code: code,
+          muted: true,
+          domain: domain,
+          streamId: 0,
+          controls: false, // Hide controls in headless mode
+          handleError: function(err) {
+            console.error("imouPlayer Error:", err);
+            window.recorderStatus.error = err;
+          },
+          handleCallBack: function(event) {
+            console.log("imouPlayer Event:", event);
+            if (event.type === 'playStart') {
+              window.recorderStatus.playing = true;
+            }
+          }
+        });
+        window.recorderStatus.initialized = true;
+      } catch (e) {
+        window.recorderStatus.error = "Initialization crash: " + e.message;
+        console.error(e);
+      }
+    }
+
+    // Expose control functions for Puppeteer
+    window.startRecording = function() {
+      if (!playerInstance) return false;
+      try {
+        playerInstance.startRecord();
+        window.recorderStatus.recording = true;
+        console.log("Recording started...");
+        return true;
+      } catch (e) {
+        window.recorderStatus.error = "Failed to start recording: " + e.message;
+        return false;
+      }
+    };
+
+    window.stopRecording = function() {
+      if (!playerInstance) return false;
+      try {
+        playerInstance.stopRecord();
+        window.recorderStatus.recording = false;
+        window.recorderStatus.downloadStarted = true;
+        console.log("Recording stopped. Download triggered.");
+        return true;
+      } catch (e) {
+        window.recorderStatus.error = "Failed to stop recording: " + e.message;
+        return false;
+      }
+    };
+
+    window.setPlaybackSpeed = function(speed) {
+      if (!playerInstance) return false;
+      try {
+        playerInstance.setSpeed(Number(speed));
+        console.log("Speed set to " + speed);
+        return true;
+      } catch (e) {
+        console.error("Failed to set speed:", e);
+        return false;
+      }
+    };
+
+    // Auto init on page load
+    window.addEventListener('load', initPlayer);
+  </script>
+</body>
+</html>
