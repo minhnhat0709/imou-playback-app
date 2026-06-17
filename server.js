@@ -283,9 +283,26 @@ async function recordAndUploadFlow({
     const puppeteerModule = await import('puppeteer');
     const puppeteer = puppeteerModule.default || puppeteerModule;
 
+    // Detect environment
+    const isWindows = process.platform === 'win32';
+    const launchArgs = ['--no-sandbox', '--disable-setuid-sandbox'];
+
+    if (!isWindows) {
+      // Force software rendering for WebGL in virtualized Linux environments
+      process.env.LIBGL_ALWAYS_SOFTWARE = '1';
+      launchArgs.push(
+        '--disable-gpu',
+        '--use-gl=swiftshader',
+        '--disable-dev-shm-usage',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding'
+      );
+    }
+
     browser = await puppeteer.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
+      args: launchArgs
     });
 
     const page = await browser.newPage();
@@ -297,8 +314,10 @@ async function recordAndUploadFlow({
       console.log(`[Browser Resource Request Failed] ${request.url()} - ${request.failure() ? request.failure().errorText : 'unknown'}`);
     });
     page.on('response', response => {
-      if (!response.ok()) {
-        console.log(`[Browser Response Non-OK] ${response.url()} status=${response.status()}`);
+      const status = response.status();
+      // Ignore 304 (Not Modified) caching redirects, as they are not errors
+      if (!response.ok() && status !== 304) {
+        console.log(`[Browser Response Non-OK] ${response.url()} status=${status}`);
       }
     });
 
