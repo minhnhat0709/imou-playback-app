@@ -51,8 +51,15 @@ echo "NPM version:    $(npm -v)"
 if command -v apt-get &> /dev/null; then
   echo "Debian/Ubuntu detected. Installing system dependencies for headless Chrome..."
   apt-get update
+  
+  # Detect libasound2 vs libasound2t64 (Ubuntu 24.04+)
+  ASOUND_LIB="libasound2"
+  if apt-cache show libasound2t64 &>/dev/null; then
+    ASOUND_LIB="libasound2t64"
+  fi
+
   apt-get install -y \
-    libasound2 \
+    "$ASOUND_LIB" \
     libatk1.0-0 \
     libatk-bridge2.0-0 \
     libcairo2 \
@@ -96,7 +103,7 @@ cd "$APP_DIR"
 npm install --omit=dev
 
 echo "Installing Puppeteer Chrome browser binary..."
-npx puppeteer browsers install chrome
+npx puppeteer browsers install chrome --install-deps
 
 # 3. Handle Environment Variables Setup
 ENV_FILE="$APP_DIR/.env"

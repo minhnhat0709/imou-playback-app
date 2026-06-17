@@ -282,7 +282,6 @@ async function recordAndUploadFlow({
     console.log(`[Puppeteer] Launching browser...`);
     const puppeteerModule = await import('puppeteer');
     const puppeteer = puppeteerModule.default || puppeteerModule;
-
     // Detect environment
     const isWindows = process.platform === 'win32';
     const launchArgs = ['--no-sandbox', '--disable-setuid-sandbox'];
@@ -292,7 +291,10 @@ async function recordAndUploadFlow({
       process.env.LIBGL_ALWAYS_SOFTWARE = '1';
       launchArgs.push(
         '--disable-gpu',
-        '--use-gl=swiftshader',
+        '--use-gl=angle',
+        '--use-angle=swiftshader',
+        '--enable-unsafe-swiftshader',
+        '--ignore-gpu-blocklist',
         '--disable-dev-shm-usage',
         '--disable-background-timer-throttling',
         '--disable-backgrounding-occluded-windows',
@@ -525,8 +527,8 @@ function initMqtt() {
 
         // 3. Compute time bounds (currentTime - 7s to currentTime + 7s) now.getTime()
         const now = new Date();
-        const start = new Date(1781634580000 - 7000);
-        const end = new Date(1781634580000 + 7000);
+        const start = new Date(now.getTime() - 7000);
+        const end = new Date(now.getTime() + 7000);
 
         const beginTime = formatDate(start);
         const endTime = formatDate(end);
