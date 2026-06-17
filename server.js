@@ -291,7 +291,9 @@ async function recordAndUploadFlow({
         '--disable-dev-shm-usage',
         '--disable-gpu',
         '--no-zygote',
-        '--single-process'
+        '--single-process',
+        '--mute-audio',
+        '--autoplay-policy=no-user-gesture-required'
       ]
     });
 
@@ -300,6 +302,9 @@ async function recordAndUploadFlow({
     // Log messages from headless browser console
     page.on('console', msg => console.log('[Browser Console]', msg.text()));
     page.on('pageerror', err => console.error('[Browser Error]', err.toString()));
+    page.on('request', request => {
+      console.log(`[Browser Request Initiated] ${request.method()} ${request.url()}`);
+    });
     page.on('requestfailed', request => {
       console.log(`[Browser Resource Request Failed] ${request.url()} - ${request.failure() ? request.failure().errorText : 'unknown'}`);
     });
