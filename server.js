@@ -532,6 +532,9 @@ function initMqtt() {
 
         const beginTime = formatDate(start);
         const endTime = formatDate(end);
+        // Optional: Wait 15 seconds to allow the camera to finalize the record file on the SD card
+        console.log('[Imou] Waiting 5 seconds for camera to write the video file to SD card...');
+        await new Promise(r => setTimeout(r, 5000));
 
         console.log(`[MQTT Job] Queueing job parameters:
           - Drop ID: ${dropId}
