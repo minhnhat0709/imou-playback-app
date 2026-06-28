@@ -14,6 +14,7 @@ const PORT = process.env.PORT || 3000;
 const IMOU_APP_ID = process.env.IMOU_APP_ID;
 const IMOU_APP_SECRET = process.env.IMOU_APP_SECRET;
 const IMOU_DATA_CENTER = process.env.IMOU_DATA_CENTER || 'sg';
+const CAMERA_TIMEZONE = process.env.CAMERA_TIMEZONE || 'Asia/Ho_Chi_Minh';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
@@ -64,16 +65,43 @@ if (R2_ACCOUNT_ID && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY) {
   console.warn('[Cloudflare R2] Warning: Cloudflare R2 credentials are not fully configured.');
 }
 
-// Format date helper: YYYY-MM-DD HH:mm:ss
+// Format date helper: YYYY-MM-DD HH:mm:ss in camera's specific timezone
 function formatDate(date) {
-  const pad = num => String(num).padStart(2, '0');
-  const yyyy = date.getFullYear();
-  const mm = pad(date.getMonth() + 1);
-  const dd = pad(date.getDate());
-  const hh = pad(date.getHours());
-  const min = pad(date.getMinutes());
-  const ss = pad(date.getSeconds());
-  return `${yyyy}-${mm}-${dd} ${hh}:${min}:${ss}`;
+  try {
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: CAMERA_TIMEZONE,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false
+    });
+
+    const parts = formatter.formatToParts(date);
+    const getPart = type => parts.find(p => p.type === type).value;
+
+    const yyyy = getPart('year');
+    const mm = getPart('month');
+    const dd = getPart('day');
+    let hh = getPart('hour');
+    if (hh === '24') hh = '00'; // Fix standard edge case
+    const min = getPart('minute');
+    const ss = getPart('second');
+
+    return `${yyyy}-${mm}-${dd} ${hh}:${min}:${ss}`;
+  } catch (err) {
+    console.error('[Timezone Error] Fallback to server local time format:', err.message);
+    const pad = num => String(num).padStart(2, '0');
+    const yyyy = date.getFullYear();
+    const mm = pad(date.getMonth() + 1);
+    const dd = pad(date.getDate());
+    const hh = pad(date.getHours());
+    const min = pad(date.getMinutes());
+    const ss = pad(date.getSeconds());
+    return `${yyyy}-${mm}-${dd} ${hh}:${min}:${ss}`;
+  }
 }
 
 // Generate MD5 Sign for Imou OpenAPI
@@ -146,26 +174,26 @@ function cleanupOldVideos() {
 }
 
 // Get/Refresh Imou AccessToken & KitToken internally without loopback REST call
-async function getKitToken(deviceId, channelId) {
+// Get or refresh Imou AccessToken
+async function getAccessToken() {
   const dc = IMOU_DATA_CENTER.toLowerCase();
   const apiBaseUrl = `https://openapi-${dc}.easy4ip.com/openapi`;
   const nowMs = Date.now();
   const bufferMs = 300000; // 5-minute buffer
 
   let cache = readCache();
-
-  // 1. Fetch or Reuse Access Token
   let accessToken = cache.accessToken;
+
   if (!accessToken || (cache.accessTokenExpiresAt - nowMs) < bufferMs) {
     console.log('[Imou] Fetching new accessToken...');
-    const time1 = Math.floor(nowMs / 1000);
-    const nonce1 = uuidv4();
-    const sign1 = generateSign(time1, nonce1, IMOU_APP_SECRET);
-    const id1 = uuidv4();
+    const time = Math.floor(nowMs / 1000);
+    const nonce = uuidv4();
+    const sign = generateSign(time, nonce, IMOU_APP_SECRET);
+    const id = uuidv4();
 
     const tokenRes = await axios.post(`${apiBaseUrl}/accessToken`, {
-      system: { ver: "1.0", appId: IMOU_APP_ID, sign: sign1, time: time1, nonce: nonce1 },
-      id: id1,
+      system: { ver: "1.0", appId: IMOU_APP_ID, sign, time, nonce },
+      id,
       params: {}
     });
 
@@ -180,7 +208,54 @@ async function getKitToken(deviceId, channelId) {
     writeCache(cache);
   }
 
-  // 2. Fetch or Reuse Kit Token
+  return accessToken;
+}
+
+// Query device local records via OpenAPI
+async function queryLocalRecords(deviceId, beginTime, endTime) {
+  const dc = IMOU_DATA_CENTER.toLowerCase();
+  const apiBaseUrl = `https://openapi-${dc}.easy4ip.com/openapi`;
+  const nowMs = Date.now();
+  const time = Math.floor(nowMs / 1000);
+  const nonce = uuidv4();
+  const sign = generateSign(time, nonce, IMOU_APP_SECRET);
+  const id = uuidv4();
+
+  const accessToken = await getAccessToken();
+
+  const recordsRes = await axios.post(`${apiBaseUrl}/queryLocalRecords`, {
+    system: { ver: "1.0", appId: IMOU_APP_ID, sign, time, nonce },
+    id,
+    params: {
+      token: accessToken,
+      deviceId,
+      channelId: "0",
+      beginTime,
+      endTime,
+      type: "All",
+      queryRange: "1-30"
+    }
+  });
+
+  const recordsData = recordsRes.data;
+  if (!recordsData.result || recordsData.result.code !== "0") {
+    throw new Error(`Failed to query local records: ${JSON.stringify(recordsData.result)}`);
+  }
+
+  return recordsData.result.data.records || [];
+}
+
+// Get/Refresh Imou AccessToken & KitToken internally without loopback REST call
+async function getKitToken(deviceId, channelId) {
+  const dc = IMOU_DATA_CENTER.toLowerCase();
+  const apiBaseUrl = `https://openapi-${dc}.easy4ip.com/openapi`;
+  const nowMs = Date.now();
+  const bufferMs = 300000; // 5-minute buffer
+
+  let cache = readCache();
+  const accessToken = await getAccessToken();
+
+  // Fetch or Reuse Kit Token
   const kitKey = `${deviceId}:${channelId}`;
   let kitToken = cache.kitTokens[kitKey] ? cache.kitTokens[kitKey].token : null;
   const kitTokenExpiresAt = cache.kitTokens[kitKey] ? cache.kitTokens[kitKey].expiresAt : 0;
@@ -312,6 +387,9 @@ async function recordAndUploadFlow({
     // Log messages from headless browser console
     page.on('console', msg => console.log('[Browser Console]', msg.text()));
     page.on('pageerror', err => console.error('[Browser Error]', err.toString()));
+    page.on('request', request => {
+      console.log(`[Browser Request Initiated] ${request.method()} ${request.url()}`);
+    });
     page.on('requestfailed', request => {
       console.log(`[Browser Resource Request Failed] ${request.url()} - ${request.failure() ? request.failure().errorText : 'unknown'}`);
     });
@@ -525,7 +603,7 @@ function initMqtt() {
           throw new Error(`Machine ${machineId} does not have a camera_device_id set.`);
         }
 
-        // 3. Compute time bounds (currentTime - 7s to currentTime + 7s) now.getTime()
+        // 3. Compute dynamic time bounds (eventTime - 7s to eventTime + 7s) in camera timezone
         const now = new Date();
         const start = new Date(now.getTime() - 7000);
         const end = new Date(now.getTime() + 7000);
