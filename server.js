@@ -173,38 +173,104 @@ function cleanupOldVideos() {
   }
 }
 
-// Get/Refresh Imou AccessToken & KitToken internally without loopback REST call
+// Fetch dynamic Imou credentials from database merchants table
+async function getImouCredentials({ dropId, deviceId }) {
+  if (!supabase) {
+    return { appId: IMOU_APP_ID, appSecret: IMOU_APP_SECRET };
+  }
+
+  try {
+    // 1. If valid dropId is provided, lookup machine and merchant
+    if (dropId && dropId !== 999 && dropId !== '999') {
+      const { data: dropData, error: dropError } = await supabase
+        .from('drops')
+        .select('machine_id')
+        .eq('id', dropId)
+        .single();
+
+      if (!dropError && dropData && dropData.machine_id) {
+        const { data: machineData, error: machineError } = await supabase
+          .from('machines')
+          .select('merchants (imou_app_id, imou_app_secret)')
+          .eq('id', dropData.machine_id)
+          .single();
+
+        if (!machineError && machineData?.merchants) {
+          const appId = machineData.merchants.imou_app_id;
+          const appSecret = machineData.merchants.imou_app_secret;
+          if (appId && appSecret) {
+            console.log(`[Credentials] Found custom developer credentials in DB for dropId ${dropId} (appId: ${appId})`);
+            return { appId, appSecret };
+          }
+        }
+      }
+    }
+
+    // 2. Fallback to lookup by device ID if available
+    if (deviceId) {
+      const { data: machineData, error: machineError } = await supabase
+        .from('machines')
+        .select('merchants (imou_app_id, imou_app_secret)')
+        .eq('camera_device_id', deviceId)
+        .limit(1)
+        .maybeSingle();
+
+      if (!machineError && machineData?.merchants) {
+        const appId = machineData.merchants.imou_app_id;
+        const appSecret = machineData.merchants.imou_app_secret;
+        if (appId && appSecret) {
+          console.log(`[Credentials] Found custom developer credentials in DB for deviceId ${deviceId} (appId: ${appId})`);
+          return { appId, appSecret };
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[Credentials Lookup Error] Failed to fetch dynamic credentials:', err.message);
+  }
+
+  // 3. Fallback to default environment credentials
+  return { appId: IMOU_APP_ID, appSecret: IMOU_APP_SECRET };
+}
+
 // Get or refresh Imou AccessToken
-async function getAccessToken() {
+async function getAccessToken(appId, appSecret) {
   const dc = IMOU_DATA_CENTER.toLowerCase();
   const apiBaseUrl = `https://openapi-${dc}.easy4ip.com/openapi`;
   const nowMs = Date.now();
   const bufferMs = 300000; // 5-minute buffer
 
   let cache = readCache();
-  let accessToken = cache.accessToken;
+  if (!cache.accounts) {
+    cache.accounts = {};
+  }
+  if (!cache.accounts[appId]) {
+    cache.accounts[appId] = { accessToken: null, accessTokenExpiresAt: 0, kitTokens: {} };
+  }
 
-  if (!accessToken || (cache.accessTokenExpiresAt - nowMs) < bufferMs) {
-    console.log('[Imou] Fetching new accessToken...');
+  const account = cache.accounts[appId];
+  let accessToken = account.accessToken;
+
+  if (!accessToken || (account.accessTokenExpiresAt - nowMs) < bufferMs) {
+    console.log(`[Imou] Fetching new accessToken for appId ${appId}...`);
     const time = Math.floor(nowMs / 1000);
     const nonce = uuidv4();
-    const sign = generateSign(time, nonce, IMOU_APP_SECRET);
+    const sign = generateSign(time, nonce, appSecret);
     const id = uuidv4();
 
     const tokenRes = await axios.post(`${apiBaseUrl}/accessToken`, {
-      system: { ver: "1.0", appId: IMOU_APP_ID, sign, time, nonce },
+      system: { ver: "1.0", appId, sign, time, nonce },
       id,
       params: {}
     });
 
     const tokenData = tokenRes.data;
     if (!tokenData.result || tokenData.result.code !== "0") {
-      throw new Error(`Failed to fetch accessToken: ${JSON.stringify(tokenData.result)}`);
+      throw new Error(`Failed to fetch accessToken for appId ${appId}: ${JSON.stringify(tokenData.result)}`);
     }
 
     accessToken = tokenData.result.data.accessToken;
-    cache.accessToken = accessToken;
-    cache.accessTokenExpiresAt = nowMs + (tokenData.result.data.expireTime * 1000);
+    account.accessToken = accessToken;
+    account.accessTokenExpiresAt = nowMs + (tokenData.result.data.expireTime * 1000);
     writeCache(cache);
   }
 
@@ -212,19 +278,19 @@ async function getAccessToken() {
 }
 
 // Query device local records via OpenAPI
-async function queryLocalRecords(deviceId, beginTime, endTime) {
+async function queryLocalRecords(deviceId, beginTime, endTime, appId, appSecret) {
   const dc = IMOU_DATA_CENTER.toLowerCase();
   const apiBaseUrl = `https://openapi-${dc}.easy4ip.com/openapi`;
   const nowMs = Date.now();
   const time = Math.floor(nowMs / 1000);
   const nonce = uuidv4();
-  const sign = generateSign(time, nonce, IMOU_APP_SECRET);
+  const sign = generateSign(time, nonce, appSecret);
   const id = uuidv4();
 
-  const accessToken = await getAccessToken();
+  const accessToken = await getAccessToken(appId, appSecret);
 
   const recordsRes = await axios.post(`${apiBaseUrl}/queryLocalRecords`, {
-    system: { ver: "1.0", appId: IMOU_APP_ID, sign, time, nonce },
+    system: { ver: "1.0", appId, sign, time, nonce },
     id,
     params: {
       token: accessToken,
@@ -246,29 +312,37 @@ async function queryLocalRecords(deviceId, beginTime, endTime) {
 }
 
 // Get/Refresh Imou AccessToken & KitToken internally without loopback REST call
-async function getKitToken(deviceId, channelId) {
+async function getKitToken(deviceId, channelId, appId, appSecret) {
   const dc = IMOU_DATA_CENTER.toLowerCase();
   const apiBaseUrl = `https://openapi-${dc}.easy4ip.com/openapi`;
   const nowMs = Date.now();
   const bufferMs = 300000; // 5-minute buffer
 
   let cache = readCache();
-  const accessToken = await getAccessToken();
+  if (!cache.accounts) {
+    cache.accounts = {};
+  }
+  if (!cache.accounts[appId]) {
+    cache.accounts[appId] = { accessToken: null, accessTokenExpiresAt: 0, kitTokens: {} };
+  }
+
+  const account = cache.accounts[appId];
+  const accessToken = await getAccessToken(appId, appSecret);
 
   // Fetch or Reuse Kit Token
   const kitKey = `${deviceId}:${channelId}`;
-  let kitToken = cache.kitTokens[kitKey] ? cache.kitTokens[kitKey].token : null;
-  const kitTokenExpiresAt = cache.kitTokens[kitKey] ? cache.kitTokens[kitKey].expiresAt : 0;
+  let kitToken = account.kitTokens[kitKey] ? account.kitTokens[kitKey].token : null;
+  const kitTokenExpiresAt = account.kitTokens[kitKey] ? account.kitTokens[kitKey].expiresAt : 0;
 
   if (!kitToken || (kitTokenExpiresAt - nowMs) < bufferMs) {
-    console.log(`[Imou] Fetching new kitToken for ${kitKey}...`);
+    console.log(`[Imou] Fetching new kitToken for ${kitKey} (appId: ${appId})...`);
     const time2 = Math.floor(nowMs / 1000);
     const nonce2 = uuidv4();
-    const sign2 = generateSign(time2, nonce2, IMOU_APP_SECRET);
+    const sign2 = generateSign(time2, nonce2, appSecret);
     const id2 = uuidv4();
 
     const kitTokenRes = await axios.post(`${apiBaseUrl}/getKitToken`, {
-      system: { ver: "1.0", appId: IMOU_APP_ID, sign: sign2, time: time2, nonce: nonce2 },
+      system: { ver: "1.0", appId, sign: sign2, time: time2, nonce: nonce2 },
       id: id2,
       params: {
         token: accessToken,
@@ -280,11 +354,11 @@ async function getKitToken(deviceId, channelId) {
 
     const kitTokenData = kitTokenRes.data;
     if (!kitTokenData.result || kitTokenData.result.code !== "0") {
-      throw new Error(`Failed to fetch kitToken: ${JSON.stringify(kitTokenData.result)}`);
+      throw new Error(`Failed to fetch kitToken for ${kitKey} (appId: ${appId}): ${JSON.stringify(kitTokenData.result)}`);
     }
 
     kitToken = kitTokenData.result.data.kitToken;
-    cache.kitTokens[kitKey] = {
+    account.kitTokens[kitKey] = {
       token: kitToken,
       expiresAt: nowMs + (kitTokenData.result.data.expireTime * 1000)
     };
@@ -323,7 +397,9 @@ async function recordAndUploadFlow({
   safetyCode,
   beginTime,
   endTime,
-  speed = 1
+  speed = 1,
+  appId,
+  appSecret
 }) {
   const startMs = new Date(beginTime).getTime();
   const endMs = new Date(endTime).getTime();
@@ -339,8 +415,17 @@ async function recordAndUploadFlow({
   let browser = null;
 
   try {
-    // 1. Retrieve the kitToken
-    const kitToken = await getKitToken(deviceId, 0);
+    // 1. Resolve dynamic credentials if not pre-fetched
+    let resolvedAppId = appId;
+    let resolvedAppSecret = appSecret;
+    if (!resolvedAppId || !resolvedAppSecret) {
+      const creds = await getImouCredentials({ dropId, deviceId });
+      resolvedAppId = creds.appId;
+      resolvedAppSecret = creds.appSecret;
+    }
+
+    // 2. Retrieve the kitToken
+    const kitToken = await getKitToken(deviceId, 0, resolvedAppId, resolvedAppSecret);
 
     // 2. Build the headless player recording URL
     const params = new URLSearchParams({
@@ -522,7 +607,9 @@ async function processRecordingQueue() {
       safetyCode: job.safetyCode,
       beginTime: job.beginTime,
       endTime: job.endTime,
-      speed: 1 // Forced speed to 1 as speed 8 causes empty or unusable videos
+      speed: 1, // Forced speed to 1 as speed 8 causes empty or unusable videos
+      appId: job.appId,
+      appSecret: job.appSecret
     });
     console.log(`[Queue] Finished job for drop ${job.dropId} successfully.`, result);
   } catch (err) {
@@ -585,10 +672,10 @@ function initMqtt() {
         const machineId = dropData.machine_id;
         console.log(`[Supabase] Found machine_id: ${machineId}. Querying camera SN and safecode...`);
 
-        // 2. Fetch camera device ID and safecode from machine table
+        // 2. Fetch camera device ID, safecode, and merchant credentials from machine table
         const { data: machineData, error: machineError } = await supabase
           .from('machines')
-          .select('camera_device_id, camera_safecode')
+          .select('camera_device_id, camera_safecode, merchant_id, merchants (imou_app_id, imou_app_secret)')
           .eq('id', machineId)
           .single();
 
@@ -598,6 +685,8 @@ function initMqtt() {
 
         const deviceId = machineData.camera_device_id;
         const safetyCode = machineData.camera_safecode;
+        const appId = machineData.merchants?.imou_app_id || IMOU_APP_ID;
+        const appSecret = machineData.merchants?.imou_app_secret || IMOU_APP_SECRET;
 
         if (!deviceId) {
           throw new Error(`Machine ${machineId} does not have a camera_device_id set.`);
@@ -626,7 +715,9 @@ function initMqtt() {
           deviceId,
           safetyCode,
           beginTime,
-          endTime
+          endTime,
+          appId,
+          appSecret
         });
 
         processRecordingQueue();
@@ -654,7 +745,8 @@ app.post('/api/localRecords', async (req, res) => {
     return res.status(400).json({ success: false, error: "Missing deviceId or channelId" });
   }
   try {
-    const kitToken = await getKitToken(deviceId, channelId);
+    const creds = await getImouCredentials({ deviceId });
+    const kitToken = await getKitToken(deviceId, channelId, creds.appId, creds.appSecret);
     res.json({ success: true, kitToken });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
