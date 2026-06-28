@@ -348,7 +348,7 @@ async function getKitToken(deviceId, channelId, appId, appSecret) {
         token: accessToken,
         deviceId,
         channelId: String(channelId),
-        type: "2"
+        type: "0"
       }
     });
 
@@ -622,20 +622,51 @@ async function processRecordingQueue() {
 }
 
 // Initialize MQTT Client and subscribe to topic
-function initMqtt() {
-  console.log(`[MQTT] Connecting to broker: ${MQTT_BROKER_URL}...`);
-  const client = mqtt.connect(MQTT_BROKER_URL);
+let mqttClient = null;
+let mqttHealthInterval = null;
+let disconnectedSeconds = 0;
 
-  client.on('connect', () => {
+function initMqtt() {
+  if (mqttClient) {
+    try {
+      console.log('[MQTT] Ending existing client before re-initializing...');
+      mqttClient.end(true);
+    } catch (err) {
+      console.error('[MQTT] Error closing old client:', err.message);
+    }
+    mqttClient = null;
+  }
+  if (mqttHealthInterval) {
+    clearInterval(mqttHealthInterval);
+    mqttHealthInterval = null;
+  }
+
+  console.log(`[MQTT] Connecting to broker: ${MQTT_BROKER_URL}...`);
+  mqttClient = mqtt.connect(MQTT_BROKER_URL);
+
+  mqttClient.on('connect', () => {
     console.log(`[MQTT] Connected. Subscribing to topic: ${MQTT_TOPIC}`);
-    client.subscribe(MQTT_TOPIC, (err) => {
+    disconnectedSeconds = 0;
+    mqttClient.subscribe(MQTT_TOPIC, (err) => {
       if (err) {
         console.error(`[MQTT] Subscription error on topic ${MQTT_TOPIC}:`, err.message);
       }
     });
   });
 
-  client.on('message', async (topic, message) => {
+  mqttClient.on('offline', () => {
+    console.warn('[MQTT] Client went offline.');
+  });
+
+  mqttClient.on('close', () => {
+    console.warn('[MQTT] Connection closed.');
+  });
+
+  mqttClient.on('error', (err) => {
+    console.error('[MQTT Client Error]', err.message);
+  });
+
+  mqttClient.on('message', async (topic, message) => {
     const payload = message.toString().trim();
     console.log(`[MQTT] Received message on ${topic}: "${payload}"`);
 
@@ -657,11 +688,11 @@ function initMqtt() {
           throw new Error('Supabase client is not configured. Cannot process MQTT trigger.');
         }
 
-        // 1. Fetch machine_id from drop table
-        console.log(`[Supabase] Fetching machine_id for drop_id: ${dropId}...`);
+        // 1. Fetch machine_id and created_at from drop table
+        console.log(`[Supabase] Fetching machine_id and created_at for drop_id: ${dropId}...`);
         const { data: dropData, error: dropError } = await supabase
           .from('drops')
-          .select('machine_id')
+          .select('machine_id, created_at')
           .eq('id', dropId)
           .single();
 
@@ -679,6 +710,8 @@ function initMqtt() {
           .eq('id', machineId)
           .single();
 
+        console.log(`[Supabase] Found machine with id ${machineId}:`, machineData);
+
         if (machineError || !machineData) {
           throw new Error(`Failed to find machine with id ${machineId}: ${machineError?.message}`);
         }
@@ -693,15 +726,15 @@ function initMqtt() {
         }
 
         // 3. Compute dynamic time bounds (eventTime - 7s to eventTime + 7s) in camera timezone
-        const now = new Date();
-        const start = new Date(now.getTime() - 7000);
-        const end = new Date(now.getTime() + 7000);
+        const eventTime = dropData.created_at ? new Date(dropData.created_at) : new Date();
+        const start = new Date(eventTime.getTime() - 7000);
+        const end = new Date(eventTime.getTime() + 7000);
 
         const beginTime = formatDate(start);
         const endTime = formatDate(end);
         // Optional: Wait 15 seconds to allow the camera to finalize the record file on the SD card
-        console.log('[Imou] Waiting 5 seconds for camera to write the video file to SD card...');
-        await new Promise(r => setTimeout(r, 5000));
+        console.log('[Imou] Waiting 10 seconds for camera to write the video file to SD card...');
+        await new Promise(r => setTimeout(r, 10000));
 
         console.log(`[MQTT Job] Queueing job parameters:
           - Drop ID: ${dropId}
@@ -730,9 +763,28 @@ function initMqtt() {
     }
   });
 
-  client.on('error', (err) => {
-    console.error('[MQTT Client Error]', err.message);
-  });
+  // Start health check interval
+  disconnectedSeconds = 0;
+  mqttHealthInterval = setInterval(() => {
+    if (!mqttClient || !mqttClient.connected) {
+      disconnectedSeconds += 30;
+      console.warn(`[MQTT Health Check] MQTT client is disconnected. (Total offline time: ${disconnectedSeconds}s)`);
+      if (disconnectedSeconds >= 60) {
+        console.error(`[MQTT Health Check] Connection lost for ${disconnectedSeconds}s. Force resetting connection...`);
+        resetMqttConnection();
+      }
+    } else {
+      if (disconnectedSeconds > 0) {
+        console.log(`[MQTT Health Check] Connection recovered. Resetting counter.`);
+      }
+      disconnectedSeconds = 0;
+    }
+  }, 30000); // Check every 30 seconds
+}
+
+function resetMqttConnection() {
+  console.log('[MQTT] Resetting connection...');
+  initMqtt();
 }
 
 // Start MQTT client connection
