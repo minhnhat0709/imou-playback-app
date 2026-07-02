@@ -312,7 +312,7 @@ async function queryLocalRecords(deviceId, beginTime, endTime, appId, appSecret)
 }
 
 // Get/Refresh Imou AccessToken & KitToken internally without loopback REST call
-async function getKitToken(deviceId, channelId, appId, appSecret) {
+async function getKitToken(deviceId, channelId, appId, appSecret, forceRefresh = false) {
   const dc = IMOU_DATA_CENTER.toLowerCase();
   const apiBaseUrl = `https://openapi-${dc}.easy4ip.com/openapi`;
   const nowMs = Date.now();
@@ -331,11 +331,11 @@ async function getKitToken(deviceId, channelId, appId, appSecret) {
 
   // Fetch or Reuse Kit Token
   const kitKey = `${deviceId}:${channelId}`;
-  let kitToken = account.kitTokens[kitKey] ? account.kitTokens[kitKey].token : null;
-  const kitTokenExpiresAt = account.kitTokens[kitKey] ? account.kitTokens[kitKey].expiresAt : 0;
+  let kitToken = (!forceRefresh && account.kitTokens[kitKey]) ? account.kitTokens[kitKey].token : null;
+  const kitTokenExpiresAt = (!forceRefresh && account.kitTokens[kitKey]) ? account.kitTokens[kitKey].expiresAt : 0;
 
   if (!kitToken || (kitTokenExpiresAt - nowMs) < bufferMs) {
-    console.log(`[Imou] Fetching new kitToken for ${kitKey} (appId: ${appId})...`);
+    console.log(`[Imou] Fetching new kitToken for ${kitKey} (appId: ${appId}) (forceRefresh: ${forceRefresh})...`);
     const time2 = Math.floor(nowMs / 1000);
     const nonce2 = uuidv4();
     const sign2 = generateSign(time2, nonce2, appSecret);
@@ -395,11 +395,13 @@ async function recordAndUploadFlow({
   dropId,
   deviceId,
   safetyCode,
+  cameraStorageType,
   beginTime,
   endTime,
   speed = 1,
   appId,
-  appSecret
+  appSecret,
+  forceRefreshKitToken = false
 }) {
   const startMs = new Date(beginTime).getTime();
   const endMs = new Date(endTime).getTime();
@@ -424,10 +426,44 @@ async function recordAndUploadFlow({
       resolvedAppSecret = creds.appSecret;
     }
 
-    // 2. Retrieve the kitToken
-    const kitToken = await getKitToken(deviceId, 0, resolvedAppId, resolvedAppSecret);
+    // 2. Resolve camera storage type
+    let resolvedStorageType = cameraStorageType;
+    if (!resolvedStorageType && supabase) {
+      try {
+        if (dropId && dropId !== 999 && dropId !== '999') {
+          const { data: dropData } = await supabase
+            .from('drops')
+            .select('machine_id')
+            .eq('id', dropId)
+            .single();
+          if (dropData && dropData.machine_id) {
+            const { data: machineData } = await supabase
+              .from('machines')
+              .select('camera_storage_type')
+              .eq('id', dropData.machine_id)
+              .single();
+            resolvedStorageType = machineData?.camera_storage_type;
+          }
+        }
+        if (!resolvedStorageType && deviceId) {
+          const { data: machineData } = await supabase
+            .from('machines')
+            .select('camera_storage_type')
+            .eq('camera_device_id', deviceId)
+            .limit(1)
+            .maybeSingle();
+          resolvedStorageType = machineData?.camera_storage_type;
+        }
+      } catch (err) {
+        console.error('[Storage Type Lookup Error] Failed to fetch camera storage type:', err.message);
+      }
+    }
+    resolvedStorageType = resolvedStorageType || 'localRecord';
 
-    // 2. Build the headless player recording URL
+    // 3. Retrieve the kitToken
+    const kitToken = await getKitToken(deviceId, 0, resolvedAppId, resolvedAppSecret, forceRefreshKitToken);
+
+    // 4. Build the headless player recording URL
     const params = new URLSearchParams({
       deviceId,
       channelId: '0',
@@ -435,7 +471,8 @@ async function recordAndUploadFlow({
       beginTime,
       endTime,
       code: safetyCode || deviceId,
-      dataCenter: IMOU_DATA_CENTER
+      dataCenter: IMOU_DATA_CENTER,
+      recordType: resolvedStorageType
     });
     const recorderUrl = `http://localhost:${PORT}/recorder.html?${params.toString()}`;
 
@@ -599,21 +636,45 @@ async function processRecordingQueue() {
   isProcessingQueue = true;
   const job = recordingQueue.shift();
 
-  console.log(`[Queue] Starting video recording task for drop ${job.dropId}. Remaining in queue: ${recordingQueue.length}`);
+  const attempt = job.attempt || 1;
+  const forceRefreshKitToken = job.forceRefreshKitToken || false;
+
+  console.log(`[Queue] Starting video recording task for drop ${job.dropId} (Attempt ${attempt}/4). Remaining in queue: ${recordingQueue.length}`);
   try {
     const result = await recordAndUploadFlow({
       dropId: job.dropId,
       deviceId: job.deviceId,
       safetyCode: job.safetyCode,
+      cameraStorageType: job.cameraStorageType,
       beginTime: job.beginTime,
       endTime: job.endTime,
       speed: 1, // Forced speed to 1 as speed 8 causes empty or unusable videos
       appId: job.appId,
-      appSecret: job.appSecret
+      appSecret: job.appSecret,
+      forceRefreshKitToken: forceRefreshKitToken
     });
     console.log(`[Queue] Finished job for drop ${job.dropId} successfully.`, result);
   } catch (err) {
-    console.error(`[Queue Error] Failed to process job for drop ${job.dropId}:`, err.message);
+    console.error(`[Queue Error] Failed to process job for drop ${job.dropId} on attempt ${attempt}:`, err.message);
+
+    const isTimeoutError = err.message && err.message.includes("Timeout waiting for player video stream to start playing");
+
+    if (isTimeoutError) {
+      if (attempt < 4) {
+        const nextAttempt = attempt + 1;
+        const nextForceRefresh = (nextAttempt === 4);
+        recordingQueue.push({
+          ...job,
+          attempt: nextAttempt,
+          forceRefreshKitToken: nextForceRefresh
+        });
+        console.log(`[Queue] Re-queued drop ${job.dropId} for attempt ${nextAttempt} (forceRefreshKitToken: ${nextForceRefresh})`);
+      } else {
+        console.error(`[Queue Error] Drop ${job.dropId} failed after ${attempt} attempts. Skipping job.`);
+      }
+    } else {
+      console.error(`[Queue Error] Non-timeout error for drop ${job.dropId}. Skipping job.`);
+    }
   } finally {
     isProcessingQueue = false;
     // Process next item asynchronously
@@ -706,7 +767,7 @@ function initMqtt() {
         // 2. Fetch camera device ID, safecode, and merchant credentials from machine table
         const { data: machineData, error: machineError } = await supabase
           .from('machines')
-          .select('camera_device_id, camera_safecode, merchant_id, merchants (imou_app_id, imou_app_secret)')
+          .select('camera_device_id, camera_safecode, camera_storage_type, merchant_id, merchants (imou_app_id, imou_app_secret)')
           .eq('id', machineId)
           .single();
 
@@ -718,6 +779,7 @@ function initMqtt() {
 
         const deviceId = machineData.camera_device_id;
         const safetyCode = machineData.camera_safecode;
+        const cameraStorageType = machineData.camera_storage_type;
         const appId = machineData.merchants?.imou_app_id || IMOU_APP_ID;
         const appSecret = machineData.merchants?.imou_app_secret || IMOU_APP_SECRET;
 
@@ -739,6 +801,7 @@ function initMqtt() {
         console.log(`[MQTT Job] Queueing job parameters:
           - Drop ID: ${dropId}
           - Device SN: ${deviceId}
+          - Storage Type: ${cameraStorageType || 'localRecord'}
           - Safety Code: ${safetyCode ? '***' : '(Not Configured/Fallback to SN)'}
           - Range: ${beginTime} to ${endTime}`);
 
@@ -747,6 +810,7 @@ function initMqtt() {
           dropId,
           deviceId,
           safetyCode,
+          cameraStorageType,
           beginTime,
           endTime,
           appId,

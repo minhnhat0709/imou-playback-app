@@ -45,6 +45,7 @@
       const endTime = urlParams.get('endTime');
       const code = urlParams.get('code') || deviceId;
       const dataCenter = urlParams.get('dataCenter') || 'sg';
+      const recordType = urlParams.get('recordType') || 'localRecord';
       const domain = `https://openapi-${dataCenter.toLowerCase()}.easy4ip.com`;
 
       if (!deviceId || !token || !beginTime || !endTime) {
@@ -62,7 +63,7 @@
           channelId: Number(channelId),
           token: token,
           type: 2, // Playback
-          recordType: "localRecord",
+          recordType: recordType,
           beginTime: beginTime,
           endTime: endTime,
           WasmLibPath: "/",
