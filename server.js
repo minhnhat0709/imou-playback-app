@@ -788,7 +788,12 @@ function initMqtt() {
         }
 
         // 3. Compute dynamic time bounds (eventTime - 7s to eventTime + 7s) in camera timezone
-        const eventTime = dropData.created_at ? new Date(dropData.created_at) : new Date();
+        let eventTime = dropData.created_at ? new Date(dropData.created_at) : new Date();
+        // for cloud record, the video time is slightly faster than the local time
+        // so we need to compensate for this
+        if (cameraStorageType === 'cloud') {
+          eventTime = new Date(eventTime.getTime() - 5000);
+        }
         const start = new Date(eventTime.getTime() - 7000);
         const end = new Date(eventTime.getTime() + 7000);
 
