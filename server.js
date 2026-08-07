@@ -15,6 +15,8 @@ const IMOU_APP_ID = process.env.IMOU_APP_ID;
 const IMOU_APP_SECRET = process.env.IMOU_APP_SECRET;
 const IMOU_DATA_CENTER = process.env.IMOU_DATA_CENTER || 'sg';
 const CAMERA_TIMEZONE = process.env.CAMERA_TIMEZONE || 'Asia/Ho_Chi_Minh';
+const EZVIZ_APP_KEY = process.env.EZVIZ_APP_KEY;
+const EZVIZ_APP_SECRET = process.env.EZVIZ_APP_SECRET;
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
@@ -35,6 +37,14 @@ const TEMP_DIR = path.join(__dirname, 'temp_downloads');
 // Initialize Express
 const app = express();
 app.use(express.json());
+
+// Set headers for cross-domain security isolation required by EZUIKit Web SDK
+app.use((req, res, next) => {
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+  next();
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Ensure directories exist
@@ -173,10 +183,10 @@ function cleanupOldVideos() {
   }
 }
 
-// Fetch dynamic Imou credentials from database merchants table
-async function getImouCredentials({ dropId, deviceId }) {
+// Fetch dynamic camera credentials and brand from database merchants table
+async function getCameraCredentials({ dropId, deviceId }) {
   if (!supabase) {
-    return { appId: IMOU_APP_ID, appSecret: IMOU_APP_SECRET };
+    return { brand: 'imou', appId: IMOU_APP_ID, appSecret: IMOU_APP_SECRET };
   }
 
   try {
@@ -191,16 +201,26 @@ async function getImouCredentials({ dropId, deviceId }) {
       if (!dropError && dropData && dropData.machine_id) {
         const { data: machineData, error: machineError } = await supabase
           .from('machines')
-          .select('merchants (imou_app_id, imou_app_secret)')
+          .select('camera_brand, merchants (*)')
           .eq('id', dropData.machine_id)
           .single();
 
-        if (!machineError && machineData?.merchants) {
-          const appId = machineData.merchants.imou_app_id;
-          const appSecret = machineData.merchants.imou_app_secret;
-          if (appId && appSecret) {
-            console.log(`[Credentials] Found custom developer credentials in DB for dropId ${dropId} (appId: ${appId})`);
-            return { appId, appSecret };
+        if (!machineError && machineData) {
+          const brand = machineData.camera_brand || 'imou';
+          if (brand === 'ezviz') {
+            const appKey = machineData.merchants?.ezviz_app_key || EZVIZ_APP_KEY;
+            const appSecret = machineData.merchants?.ezviz_app_secret || EZVIZ_APP_SECRET;
+            if (appKey && appSecret) {
+              console.log(`[Credentials] Found custom EZVIZ credentials in DB for dropId ${dropId} (appKey: ${appKey})`);
+              return { brand, appId: appKey, appSecret };
+            }
+          } else {
+            const appId = machineData.merchants?.imou_app_id || IMOU_APP_ID;
+            const appSecret = machineData.merchants?.imou_app_secret || IMOU_APP_SECRET;
+            if (appId && appSecret) {
+              console.log(`[Credentials] Found custom Imou credentials in DB for dropId ${dropId} (appId: ${appId})`);
+              return { brand, appId, appSecret };
+            }
           }
         }
       }
@@ -210,17 +230,27 @@ async function getImouCredentials({ dropId, deviceId }) {
     if (deviceId) {
       const { data: machineData, error: machineError } = await supabase
         .from('machines')
-        .select('merchants (imou_app_id, imou_app_secret)')
+        .select('camera_brand, merchants (*)')
         .eq('camera_device_id', deviceId)
         .limit(1)
         .maybeSingle();
 
-      if (!machineError && machineData?.merchants) {
-        const appId = machineData.merchants.imou_app_id;
-        const appSecret = machineData.merchants.imou_app_secret;
-        if (appId && appSecret) {
-          console.log(`[Credentials] Found custom developer credentials in DB for deviceId ${deviceId} (appId: ${appId})`);
-          return { appId, appSecret };
+      if (!machineError && machineData) {
+        const brand = machineData.camera_brand || 'imou';
+        if (brand === 'ezviz') {
+          const appKey = machineData.merchants?.ezviz_app_key || EZVIZ_APP_KEY;
+          const appSecret = machineData.merchants?.ezviz_app_secret || EZVIZ_APP_SECRET;
+          if (appKey && appSecret) {
+            console.log(`[Credentials] Found custom EZVIZ credentials in DB for deviceId ${deviceId} (appKey: ${appKey})`);
+            return { brand, appId: appKey, appSecret };
+          }
+        } else {
+          const appId = machineData.merchants?.imou_app_id || IMOU_APP_ID;
+          const appSecret = machineData.merchants?.imou_app_secret || IMOU_APP_SECRET;
+          if (appId && appSecret) {
+            console.log(`[Credentials] Found custom Imou credentials in DB for deviceId ${deviceId} (appId: ${appId})`);
+            return { brand, appId, appSecret };
+          }
         }
       }
     }
@@ -229,7 +259,82 @@ async function getImouCredentials({ dropId, deviceId }) {
   }
 
   // 3. Fallback to default environment credentials
-  return { appId: IMOU_APP_ID, appSecret: IMOU_APP_SECRET };
+  return { brand: 'imou', appId: IMOU_APP_ID, appSecret: IMOU_APP_SECRET };
+}
+
+// Get or refresh EZVIZ AccessToken
+async function getEzvizAccessToken(appKey, appSecret) {
+  const nowMs = Date.now();
+  const bufferMs = 300000; // 5-minute buffer
+
+  let cache = readCache();
+  if (!cache.accounts) {
+    cache.accounts = {};
+  }
+  if (!cache.accounts[appKey]) {
+    cache.accounts[appKey] = { accessToken: null, accessTokenExpiresAt: 0, areaDomain: '' };
+  }
+
+  const account = cache.accounts[appKey];
+  let accessToken = account.accessToken;
+
+  if (!accessToken || (account.accessTokenExpiresAt - nowMs) < bufferMs) {
+    console.log(`[EZVIZ] Fetching new accessToken for appKey ${appKey}...`);
+    const params = new URLSearchParams();
+    params.append('appKey', appKey);
+    params.append('appSecret', appSecret);
+
+    const tokenRes = await axios.post('https://open.ezvizlife.com/api/lapp/token/get', params, {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      }
+    });
+
+    const tokenData = tokenRes.data;
+    if (tokenData.code !== "200" || !tokenData.data) {
+      throw new Error(`Failed to fetch EZVIZ accessToken for appKey ${appKey}: ${JSON.stringify(tokenData)}`);
+    }
+
+    accessToken = tokenData.data.accessToken;
+    account.accessToken = accessToken;
+    account.accessTokenExpiresAt = tokenData.data.expireTime; // Already in ms timestamp format
+    account.areaDomain = tokenData.data.areaDomain || 'https://open.ezvizlife.com';
+    writeCache(cache);
+  }
+
+  return { accessToken, areaDomain: account.areaDomain || 'https://open.ezvizlife.com' };
+}
+
+// Get EZVIZ playback URL from the platform API
+async function getEzvizPlayUrl({ appKey, appSecret, deviceSerial, channelNo = 1, type = 2, code = '', startTime, stopTime }) {
+  const { accessToken, areaDomain } = await getEzvizAccessToken(appKey, appSecret);
+
+  console.log(`[EZVIZ] Requesting play address for device ${deviceSerial} via ${areaDomain}...`);
+  const params = new URLSearchParams();
+  params.append('accessToken', accessToken);
+  params.append('deviceSerial', deviceSerial);
+  params.append('channelNo', String(channelNo));
+  params.append('protocol', '1'); // 1-ezopen
+  if (code) {
+    params.append('code', code);
+  }
+  params.append('type', String(type)); // 2-local recording playback, 3-CloudPlay recording playback
+  params.append('startTime', startTime);
+  params.append('stopTime', stopTime);
+
+  const res = await axios.post(`${areaDomain}/api/lapp/live/address/get`, params, {
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded'
+    }
+  });
+
+  const resData = res.data;
+  if (resData.code !== '200' || !resData.data || !resData.data.url) {
+    throw new Error(`Failed to get EZVIZ play address: ${JSON.stringify(resData)}`);
+  }
+
+  console.log(`[EZVIZ] Successfully obtained play address: ${resData.data.url}`);
+  return resData.data.url;
 }
 
 // Get or refresh Imou AccessToken
@@ -396,6 +501,7 @@ async function recordAndUploadFlow({
   deviceId,
   safetyCode,
   cameraStorageType,
+  cameraBrand,
   beginTime,
   endTime,
   speed = 1,
@@ -417,14 +523,17 @@ async function recordAndUploadFlow({
   let browser = null;
 
   try {
-    // 1. Resolve dynamic credentials if not pre-fetched
+    // 1. Resolve dynamic credentials and brand if not pre-fetched
+    let resolvedBrand = cameraBrand;
     let resolvedAppId = appId;
     let resolvedAppSecret = appSecret;
-    if (!resolvedAppId || !resolvedAppSecret) {
-      const creds = await getImouCredentials({ dropId, deviceId });
-      resolvedAppId = creds.appId;
-      resolvedAppSecret = creds.appSecret;
+    if (!resolvedBrand || !resolvedAppId || !resolvedAppSecret) {
+      const creds = await getCameraCredentials({ dropId, deviceId });
+      resolvedBrand = resolvedBrand || creds.brand;
+      resolvedAppId = resolvedAppId || creds.appId;
+      resolvedAppSecret = resolvedAppSecret || creds.appSecret;
     }
+    resolvedBrand = resolvedBrand || 'imou';
 
     // 2. Resolve camera storage type
     let resolvedStorageType = cameraStorageType;
@@ -460,20 +569,47 @@ async function recordAndUploadFlow({
     }
     resolvedStorageType = resolvedStorageType || 'localRecord';
 
-    // 3. Retrieve the kitToken
-    const kitToken = await getKitToken(deviceId, 0, resolvedAppId, resolvedAppSecret, forceRefreshKitToken);
+    // 3. Retrieve token, determine channel number, and fetch EZVIZ play address if needed
+    let token;
+    let channelId = '0';
+    let ezvizPlayUrl = '';
+    let ezvizAreaDomain = '';
+    if (resolvedBrand === 'ezviz') {
+      const ezvizType = (resolvedStorageType === 'cloud') ? 3 : 2;
+      ezvizPlayUrl = await getEzvizPlayUrl({
+        appKey: resolvedAppId,
+        appSecret: resolvedAppSecret,
+        deviceSerial: deviceId,
+        channelNo: 1, // Default channel is 1
+        type: ezvizType,
+        code: safetyCode,
+        startTime: beginTime,
+        stopTime: endTime
+      });
+      const tokenObj = await getEzvizAccessToken(resolvedAppId, resolvedAppSecret);
+      token = tokenObj.accessToken;
+      ezvizAreaDomain = tokenObj.areaDomain;
+      channelId = '1';
+    } else {
+      token = await getKitToken(deviceId, 0, resolvedAppId, resolvedAppSecret, forceRefreshKitToken);
+    }
 
     // 4. Build the headless player recording URL
     const params = new URLSearchParams({
+      brand: resolvedBrand,
       deviceId,
-      channelId: '0',
-      kitToken,
+      channelId,
+      kitToken: token,
       beginTime,
       endTime,
-      code: safetyCode || deviceId,
+      code: safetyCode || '',
       dataCenter: IMOU_DATA_CENTER,
       recordType: resolvedStorageType
     });
+    if (resolvedBrand === 'ezviz') {
+      params.append('playUrl', ezvizPlayUrl);
+      params.append('areaDomain', ezvizAreaDomain);
+    }
     const recorderUrl = `http://localhost:${PORT}/recorder.html?${params.toString()}`;
 
     console.log(`[Puppeteer] Launching browser...`);
@@ -558,7 +694,7 @@ async function recordAndUploadFlow({
     await page.evaluate(() => window.startRecording());
 
     // Speed up playback to record in accelerated time
-    const recordSpeed = Number(speed);
+    const recordSpeed = (resolvedBrand === 'ezviz') ? 1 : Number(speed);
     await page.evaluate((s) => window.setPlaybackSpeed(s), recordSpeed);
 
     // Sleep for the calculated accelerated duration + buffer
@@ -646,6 +782,7 @@ async function processRecordingQueue() {
       deviceId: job.deviceId,
       safetyCode: job.safetyCode,
       cameraStorageType: job.cameraStorageType,
+      cameraBrand: job.cameraBrand,
       beginTime: job.beginTime,
       endTime: job.endTime,
       speed: 1, // Forced speed to 1 as speed 8 causes empty or unusable videos
@@ -767,7 +904,7 @@ function initMqtt() {
         // 2. Fetch camera device ID, safecode, and merchant credentials from machine table
         const { data: machineData, error: machineError } = await supabase
           .from('machines')
-          .select('camera_device_id, camera_safecode, camera_storage_type, merchant_id, merchants (imou_app_id, imou_app_secret)')
+          .select('camera_brand, camera_device_id, camera_safecode, camera_storage_type, merchant_id, merchants (*)')
           .eq('id', machineId)
           .single();
 
@@ -777,11 +914,19 @@ function initMqtt() {
           throw new Error(`Failed to find machine with id ${machineId}: ${machineError?.message}`);
         }
 
+        const cameraBrand = machineData.camera_brand || 'imou';
         const deviceId = machineData.camera_device_id;
         const safetyCode = machineData.camera_safecode;
         const cameraStorageType = machineData.camera_storage_type;
-        const appId = machineData.merchants?.imou_app_id || IMOU_APP_ID;
-        const appSecret = machineData.merchants?.imou_app_secret || IMOU_APP_SECRET;
+
+        let appId, appSecret;
+        if (cameraBrand === 'ezviz') {
+          appId = machineData.merchants?.ezviz_app_key || EZVIZ_APP_KEY;
+          appSecret = machineData.merchants?.ezviz_app_secret || EZVIZ_APP_SECRET;
+        } else {
+          appId = machineData.merchants?.imou_app_id || IMOU_APP_ID;
+          appSecret = machineData.merchants?.imou_app_secret || IMOU_APP_SECRET;
+        }
 
         if (!deviceId) {
           throw new Error(`Machine ${machineId} does not have a camera_device_id set.`);
@@ -816,6 +961,7 @@ function initMqtt() {
           deviceId,
           safetyCode,
           cameraStorageType,
+          cameraBrand,
           beginTime,
           endTime,
           appId,
@@ -866,9 +1012,15 @@ app.post('/api/localRecords', async (req, res) => {
     return res.status(400).json({ success: false, error: "Missing deviceId or channelId" });
   }
   try {
-    const creds = await getImouCredentials({ deviceId });
-    const kitToken = await getKitToken(deviceId, channelId, creds.appId, creds.appSecret);
-    res.json({ success: true, kitToken });
+    const creds = await getCameraCredentials({ deviceId });
+    let token;
+    if (creds.brand === 'ezviz') {
+      const tokenObj = await getEzvizAccessToken(creds.appId, creds.appSecret);
+      token = tokenObj.accessToken;
+    } else {
+      token = await getKitToken(deviceId, channelId, creds.appId, creds.appSecret);
+    }
+    res.json({ success: true, token, brand: creds.brand });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -880,6 +1032,7 @@ app.post('/api/saveLocalVideo', async (req, res) => {
     dropId = 999,
     deviceId,
     safetyCode,
+    cameraBrand,
     beginTime,
     endTime,
     speed
@@ -894,6 +1047,7 @@ app.post('/api/saveLocalVideo', async (req, res) => {
       dropId,
       deviceId,
       safetyCode,
+      cameraBrand,
       beginTime,
       endTime,
       speed
@@ -905,5 +1059,5 @@ app.post('/api/saveLocalVideo', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Imou Playback API server running on port ${PORT}`);
+  console.log(`Imou/EZVIZ Playback API server running on port ${PORT}`);
 });

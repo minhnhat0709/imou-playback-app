@@ -1,12 +1,15 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8">
   <title>Imou Headless Recorder</title>
   <link href="./imou-player.css" rel="stylesheet" />
   <script src="./imou-player.js"></script>
+  <script src="./ezuikit.js"></script>
   <style>
-    body, html {
+    body,
+    html {
       margin: 0;
       padding: 0;
       width: 100%;
@@ -14,12 +17,22 @@
       background: #000;
       overflow: hidden;
     }
+
     #player-container {
       width: 100%;
       height: 100%;
     }
+
+    /* Hide EZUIKit control elements in browser playback to keep recording clean */
+    .ezui-toolbar,
+    .ezui-header,
+    .ezui-footer,
+    [class*="ezui-"] {
+      display: none !important;
+    }
   </style>
 </head>
+
 <body>
   <div id="player-container"></div>
 
@@ -30,7 +43,8 @@
       playing: false,
       recording: false,
       error: null,
-      downloadStarted: false
+      downloadStarted: false,
+      brand: 'imou'
     };
 
     let playerInstance = null;
@@ -38,12 +52,15 @@
     // Initialize player via query parameters
     function initPlayer() {
       const urlParams = new URLSearchParams(window.location.search);
+      const brand = urlParams.get('brand') || 'imou';
+      window.recorderStatus.brand = brand;
+
       const deviceId = urlParams.get('deviceId');
-      const channelId = urlParams.get('channelId') || '0';
+      const channelId = urlParams.get('channelId') || (brand === 'ezviz' ? '1' : '0');
       const token = urlParams.get('kitToken');
       const beginTime = urlParams.get('beginTime');
       const endTime = urlParams.get('endTime');
-      const code = urlParams.get('code') || deviceId;
+      const code = urlParams.get('code') || '';
       const dataCenter = urlParams.get('dataCenter') || 'sg';
       const recordType = urlParams.get('recordType') || 'localRecord';
       const domain = `https://openapi-${dataCenter.toLowerCase()}.easy4ip.com`;
@@ -54,47 +71,92 @@
         return;
       }
 
-      try {
-        playerInstance = new imouPlayer({
-          id: "player-container",
-          width: 800,
-          height: 400,
-          deviceId: deviceId,
-          channelId: Number(channelId),
-          token: token,
-          type: 2, // Playback
-          recordType: recordType,
-          beginTime: beginTime,
-          endTime: endTime,
-          WasmLibPath: "/",
-          code: code,
-          muted: true,
-          domain: domain,
-          streamId: 0,
-          controls: false, // Hide controls in headless mode
-          handleError: function(err) {
-            console.error("imouPlayer Error:", err);
-            window.recorderStatus.error = err;
-          },
-          handleCallBack: function(event) {
-            console.log("imouPlayer Event:", event);
-            if (event.type === 'playStart') {
+      if (brand === 'ezviz') {
+        const playUrl = urlParams.get('playUrl');
+        const areaDomain = urlParams.get('areaDomain') || 'https://open.ezvizlife.com';
+        if (!playUrl) {
+          window.recorderStatus.error = "Missing query parameter: playUrl";
+          console.error(window.recorderStatus.error);
+          return;
+        }
+
+        console.log("[EZVIZ Player] Initializing with Play URL:", playUrl, "and Domain:", areaDomain);
+
+        try {
+          playerInstance = new EZUIKit.EZUIKitPlayer({
+            id: "player-container",
+            url: playUrl,
+            accessToken: token,
+            width: 800,
+            height: 400,
+            autoplay: true,
+            decoderPath: "/ezuikit_static",
+            staticPath: "/ezuikit_static",
+            env: {
+              domain: areaDomain
+            },
+            handleError: function (err) {
+              console.error("EZUIKitPlayer Error:", err);
+              window.recorderStatus.error = err;
+            },
+            handleSuccess: function () {
+              console.log("EZUIKitPlayer Play Success!");
               window.recorderStatus.playing = true;
             }
-          }
-        });
-        window.recorderStatus.initialized = true;
-      } catch (e) {
-        window.recorderStatus.error = "Initialization crash: " + e.message;
-        console.error(e);
+          });
+          window.recorderStatus.initialized = true;
+        } catch (e) {
+          window.recorderStatus.error = "EZUIKit Initialization crash: " + e.message;
+          console.error(e);
+        }
+      } else {
+        const imouCode = code || deviceId;
+        try {
+          playerInstance = new imouPlayer({
+            id: "player-container",
+            width: 800,
+            height: 400,
+            deviceId: deviceId,
+            channelId: Number(channelId),
+            token: token,
+            type: 2, // Playback
+            recordType: recordType,
+            beginTime: beginTime,
+            endTime: endTime,
+            WasmLibPath: "/",
+            code: imouCode,
+            muted: true,
+            domain: domain,
+            streamId: 0,
+            controls: false, // Hide controls in headless mode
+            handleError: function (err) {
+              console.error("imouPlayer Error:", err);
+              window.recorderStatus.error = err;
+            },
+            handleCallBack: function (event) {
+              console.log("imouPlayer Event:", event);
+              if (event.type === 'playStart') {
+                window.recorderStatus.playing = true;
+              }
+            }
+          });
+          window.recorderStatus.initialized = true;
+        } catch (e) {
+          window.recorderStatus.error = "Initialization crash: " + e.message;
+          console.error(e);
+        }
       }
     }
 
     // Expose control functions for Puppeteer
-    window.startRecording = function() {
+    window.startRecording = function () {
       if (!playerInstance) return false;
       try {
-        playerInstance.startRecord();
+        if (window.recorderStatus.brand === 'ezviz') {
+          playerInstance.startSave();
+        } else {
+          playerInstance.startRecord();
+        }
         window.recorderStatus.recording = true;
         console.log("Recording started...");
         return true;
@@ -104,10 +166,14 @@
       }
     };
 
-    window.stopRecording = function() {
+    window.stopRecording = function () {
       if (!playerInstance) return false;
       try {
-        playerInstance.stopRecord();
+        if (window.recorderStatus.brand === 'ezviz') {
+          playerInstance.stopSave();
+        } else {
+          playerInstance.stopRecord();
+        }
         window.recorderStatus.recording = false;
         window.recorderStatus.downloadStarted = true;
         console.log("Recording stopped. Download triggered.");
@@ -118,8 +184,12 @@
       }
     };
 
-    window.setPlaybackSpeed = function(speed) {
+    window.setPlaybackSpeed = function (speed) {
       if (!playerInstance) return false;
+      if (window.recorderStatus.brand === 'ezviz') {
+        console.log("[EZVIZ Player] Speed setting ignored (not supported).");
+        return true;
+      }
       try {
         playerInstance.setSpeed(Number(speed));
         console.log("Speed set to " + speed);
@@ -134,4 +204,5 @@
     window.addEventListener('load', initPlayer);
   </script>
 </body>
+
 </html>
