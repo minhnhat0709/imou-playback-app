@@ -144,13 +144,42 @@ function writeCache(cache) {
 async function waitForDownload(dir) {
   let file = null;
   const startTime = Date.now();
-  while (Date.now() - startTime < 45000) { // 45 seconds timeout
-    const files = fs.readdirSync(dir);
-    const crdownload = files.find(f => f.endsWith('.crdownload'));
-    const mp4 = files.find(f => f.endsWith('.mp4'));
-    if (mp4 && !crdownload) {
-      file = path.join(dir, mp4);
-      break;
+  let prevSize = -1;
+  let stableCount = 0;
+
+  while (Date.now() - startTime < 60000) { // 60 seconds timeout
+    if (fs.existsSync(dir)) {
+      const files = fs.readdirSync(dir);
+      const crdownload = files.find(f => f.endsWith('.crdownload'));
+      
+      const mediaFile = files.find(f => {
+        const lower = f.toLowerCase();
+        return (lower.endsWith('.mp4') || lower.endsWith('.webm') || lower.endsWith('.ts') || lower.endsWith('.flv') || lower.endsWith('.mkv') || lower.endsWith('.asf') || lower.endsWith('.avi')) && !lower.endsWith('.crdownload');
+      });
+
+      const candidate = mediaFile || files.find(f => !f.endsWith('.crdownload') && !f.endsWith('.tmp'));
+
+      if (candidate && !crdownload) {
+        const fullCandidatePath = path.join(dir, candidate);
+        try {
+          const stats = fs.statSync(fullCandidatePath);
+          if (stats.size > 0) {
+            // Verify file size is stable (completed writing)
+            if (stats.size === prevSize) {
+              stableCount++;
+              if (stableCount >= 2) {
+                file = fullCandidatePath;
+                break;
+              }
+            } else {
+              prevSize = stats.size;
+              stableCount = 0;
+            }
+          }
+        } catch (e) {
+          // File might be briefly locked during write
+        }
+      }
     }
     await new Promise(r => setTimeout(r, 500));
   }
@@ -666,6 +695,18 @@ async function recordAndUploadFlow({
       downloadPath: tempDownloadPath
     });
 
+    // Also set Browser.setDownloadBehavior for headless Chrome anchor & blob downloads
+    try {
+      const browserClient = await browser.target().createCDPSession();
+      await browserClient.send('Browser.setDownloadBehavior', {
+        behavior: 'allow',
+        downloadPath: tempDownloadPath,
+        eventsEnabled: true
+      });
+    } catch (e) {
+      // Browser target CDP session might differ across environments
+    }
+
     console.log(`[Puppeteer] Navigating to: ${recorderUrl}`);
     await page.goto(recorderUrl);
 
@@ -794,7 +835,10 @@ async function processRecordingQueue() {
   } catch (err) {
     console.error(`[Queue Error] Failed to process job for drop ${job.dropId} on attempt ${attempt}:`, err.message);
 
-    const isTimeoutError = err.message && err.message.includes("Timeout waiting for player video stream to start playing");
+    const isTimeoutError = err.message && (
+      err.message.includes("Timeout waiting for player video stream to start playing") ||
+      err.message.includes("Video recording download timed out or failed")
+    );
 
     if (isTimeoutError) {
       if (attempt < 4) {
@@ -944,9 +988,11 @@ function initMqtt() {
 
         const beginTime = formatDate(start);
         const endTime = formatDate(end);
-        // Optional: Wait 15 seconds to allow the camera to finalize the record file on the SD card
-        console.log('[Imou] Waiting 10 seconds for camera to write the video file to SD card...');
-        await new Promise(r => setTimeout(r, 10000));
+        // Wait for the camera to finalize the record file.
+        // Local SD card recordings take longer to index (15-30s); cloud is faster.
+        const sdWaitMs = (cameraStorageType === 'cloud') ? 10000 : 22000;
+        console.log(`[Imou] Waiting ${sdWaitMs / 1000}s for camera to write the video file (storageType: ${cameraStorageType || 'localRecord'})...`);
+        await new Promise(r => setTimeout(r, sdWaitMs));
 
         console.log(`[MQTT Job] Queueing job parameters:
           - Drop ID: ${dropId}

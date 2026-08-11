@@ -90,20 +90,42 @@
             width: 800,
             height: 400,
             autoplay: true,
+            downloadRecord: true,
             decoderPath: "/ezuikit_static",
             staticPath: "/ezuikit_static",
             env: {
               domain: areaDomain
             },
             handleError: function (err) {
+              // Code 6701 is normal end of playback stream ("回放结束")
+              if (err && (err.code === 6701 || (typeof err.msg === 'string' && err.msg.includes('回放结束')))) {
+                console.log("[EZVIZ Player] Playback reached end stream normally (code 6701).");
+                return;
+              }
               console.error("EZUIKitPlayer Error:", err);
               window.recorderStatus.error = err;
             },
             handleSuccess: function () {
               console.log("EZUIKitPlayer Play Success!");
               window.recorderStatus.playing = true;
+            },
+            stopSaveCallBack: function (res) {
+              console.log("[EZVIZ Player] stopSaveCallBack triggered:", res);
+              if (res && res.data && (res.data instanceof Blob || (typeof res.data === 'string' && res.data.startsWith('blob:')))) {
+                triggerBlobDownload(res.data);
+              }
             }
           });
+
+          if (typeof playerInstance.on === 'function') {
+            playerInstance.on('stopSave', function (res) {
+              console.log("[EZVIZ Player] on('stopSave') event:", res);
+              if (res && res.data && (res.data instanceof Blob || (typeof res.data === 'string' && res.data.startsWith('blob:')))) {
+                triggerBlobDownload(res.data);
+              }
+            });
+          }
+
           window.recorderStatus.initialized = true;
         } catch (e) {
           window.recorderStatus.error = "EZUIKit Initialization crash: " + e.message;
@@ -148,12 +170,37 @@
       }
     }
 
+    // Helper to manually trigger anchor download for Blob or blob URL
+    function triggerBlobDownload(blobOrUrl, filename) {
+      try {
+        const url = (blobOrUrl instanceof Blob) ? URL.createObjectURL(blobOrUrl) : blobOrUrl;
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename || `recording_${Date.now()}.mp4`;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => {
+          document.body.removeChild(a);
+          if (blobOrUrl instanceof Blob) URL.revokeObjectURL(url);
+        }, 1000);
+        console.log("[Blob Downloader] Manually triggered download for", a.download);
+      } catch (err) {
+        console.error("[Blob Downloader Error]", err);
+      }
+    }
+
     // Expose control functions for Puppeteer
-    window.startRecording = function () {
+    window.startRecording = async function () {
       if (!playerInstance) return false;
+      const urlParams = new URLSearchParams(window.location.search);
+      const code = urlParams.get('code') || '';
       try {
         if (window.recorderStatus.brand === 'ezviz') {
-          playerInstance.startSave();
+          const recName = `rec_${Date.now()}`;
+          const res = playerInstance.startSave(recName, code);
+          if (res && typeof res.then === 'function') {
+            await res;
+          }
         } else {
           playerInstance.startRecord();
         }
@@ -166,11 +213,18 @@
       }
     };
 
-    window.stopRecording = function () {
+    window.stopRecording = async function () {
       if (!playerInstance) return false;
       try {
         if (window.recorderStatus.brand === 'ezviz') {
-          playerInstance.stopSave();
+          const res = playerInstance.stopSave();
+          if (res && typeof res.then === 'function') {
+            const stopResult = await res;
+            console.log("[EZVIZ Player] stopSave promise result:", stopResult);
+            if (stopResult && stopResult.data && (stopResult.data instanceof Blob || (typeof stopResult.data === 'string' && stopResult.data.startsWith('blob:')))) {
+              triggerBlobDownload(stopResult.data);
+            }
+          }
         } else {
           playerInstance.stopRecord();
         }
