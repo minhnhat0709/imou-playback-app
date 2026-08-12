@@ -151,7 +151,7 @@ async function waitForDownload(dir) {
     if (fs.existsSync(dir)) {
       const files = fs.readdirSync(dir);
       const crdownload = files.find(f => f.endsWith('.crdownload'));
-      
+
       const mediaFile = files.find(f => {
         const lower = f.toLowerCase();
         return (lower.endsWith('.mp4') || lower.endsWith('.webm') || lower.endsWith('.ts') || lower.endsWith('.flv') || lower.endsWith('.mkv') || lower.endsWith('.asf') || lower.endsWith('.avi')) && !lower.endsWith('.crdownload');
@@ -914,7 +914,7 @@ function initMqtt() {
 
     // Parse body format: "drop, <drop_id>"
     const parts = payload.split(',');
-    if (parts.length === 2 && parts[0].trim().toLowerCase() === 'drop') {
+    if (parts[0].trim().toLowerCase() === 'drop') {
       const dropIdStr = parts[1].trim();
       const dropId = parseInt(dropIdStr, 10);
 
