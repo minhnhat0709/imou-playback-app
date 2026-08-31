@@ -948,7 +948,7 @@ function initMqtt() {
         // 2. Fetch camera device ID, safecode, and merchant credentials from machine table
         const { data: machineData, error: machineError } = await supabase
           .from('machines')
-          .select('camera_brand, camera_device_id, camera_safecode, camera_storage_type, merchant_id, merchants (*)')
+          .select('camera_brand, camera_device_id, camera_safecode, camera_storage_type, cam_cut_adjust, merchant_id, merchants (*)')
           .eq('id', machineId)
           .single();
 
@@ -962,6 +962,7 @@ function initMqtt() {
         const deviceId = machineData.camera_device_id;
         const safetyCode = machineData.camera_safecode;
         const cameraStorageType = machineData.camera_storage_type;
+        const camCutAdjust = Number(machineData.cam_cut_adjust) || 0;
 
         let appId, appSecret;
         if (cameraBrand === 'ezviz') {
@@ -978,6 +979,9 @@ function initMqtt() {
 
         // 3. Compute dynamic time bounds (eventTime - 7s to eventTime + 7s) in camera timezone
         let eventTime = dropData.created_at ? new Date(dropData.created_at) : new Date();
+        if (camCutAdjust !== 0) {
+          eventTime = new Date(eventTime.getTime() + (camCutAdjust * 1000));
+        }
         // for cloud record, the video time is slightly faster than the local time
         // so we need to compensate for this
         if (cameraStorageType === 'cloud') {
@@ -999,6 +1003,7 @@ function initMqtt() {
           - Device SN: ${deviceId}
           - Storage Type: ${cameraStorageType || 'localRecord'}
           - Safety Code: ${safetyCode ? '***' : '(Not Configured/Fallback to SN)'}
+          - Cam Cut Adjust: ${camCutAdjust}s
           - Range: ${beginTime} to ${endTime}`);
 
         // 4. Push to FIFO Queue and process
